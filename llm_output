@@ -1,0 +1,110 @@
+import os
+import json
+import argparse
+import pandas as pd
+from collections import Counter
+from openai import OpenAI
+import time
+
+# Initialize OpenAI client using environment variable
+def init_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Please set the OPENAI_API_KEY environment variable")
+    return OpenAI(api_key=api_key)
+
+# Parse command-line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Batch extraction of Cu–X binary systems, intermediates, and descriptors from WOS export"
+    )
+    parser.add_argument(
+        "--input", required=True,
+        help="Path to input CSV file with columns 'Article Title' and 'Abstract'"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=200,
+        help="Number of records per batch"
+    )
+    parser.add_argument(
+        "--model", default="gpt-3o",
+        help="OpenAI model to use (e.g., gpt-3o or gpt-4o)"
+    )
+    return parser.parse_args()
+
+# Main extraction logic
+def main():
+    args = parse_args()
+    client = init_client()
+
+    # Load data
+    df = pd.read_csv(args.input, encoding="utf-8-sig")
+    if "Article Title" not in df.columns or "Abstract" not in df.columns:
+        raise RuntimeError("Input CSV must contain 'Article Title' and 'Abstract' columns")
+
+    binary_ctr = Counter()
+    intermediate_ctr = Counter()
+    descriptor_ctr = Counter()
+
+    num_batches = (len(df) + args.batch_size - 1) // args.batch_size
+    for i in range(num_batches):
+        batch = df.iloc[i*args.batch_size : (i+1)*args.batch_size]
+        items = [f"Title: {row['Article Title']}\nAbstract: {row['Abstract']}" \
+                 for _, row in batch.iterrows()]
+
+        prompt = (
+            f"You are a research chemist specializing in Cu-based binary catalysts for CO2 electroreduction.\n"
+            f"Given the following {len(items)} papers (title + abstract), please extract:\n"
+            "1) Unique Cu–X binary systems (alloy or doped), e.g. 'Au-Cu', 'Ag-Cu'.\n"
+            "2) Reaction intermediates mentioned, e.g. '*COOH', '*H', '*CHO', '*CO'.\n"
+            "3) Theoretical descriptors cited, e.g. 'ΔG*COOH', 'ΔG*H', 'ΔG*CHO', 'ε_d', 'work function'.\n"  
+            "Output strictly in JSON format with fields: binary_systems, intermediates, descriptors.\n\n"
+            + "\n\n".join(items)
+        )
+
+        # Call LLM with retries
+        response_text = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=args.model,
+                    messages=[
+                        {"role": "system", "content": "You are a precise extractor."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0,
+                    timeout=60.0
+                )
+                response_text = resp.choices[0].message.content.strip()
+                break
+            except Exception as e:
+                time.sleep(5)
+        if not response_text:
+            print(f"Batch {i+1}/{num_batches} failed after retries, skipping.")
+            continue
+
+        # Parse JSON
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError:
+            print(f"Batch {i+1}/{num_batches} JSON parse error, skipping.")
+            continue
+
+        # Update counters
+        binary_ctr.update(data.get("binary_systems", []))
+        intermediate_ctr.update(data.get("intermediates", []))
+        descriptor_ctr.update(data.get("descriptors", []))
+        print(f"Batch {i+1}/{num_batches} processed.")
+
+    # Summarize and save results to CSV
+    out_bin = pd.DataFrame(binary_ctr.items(), columns=["Binary System", "Count"]).sort_values("Count", ascending=False)
+    out_int = pd.DataFrame(intermediate_ctr.items(), columns=["Intermediate", "Count"]).sort_values("Count", ascending=False)
+    out_des = pd.DataFrame(descriptor_ctr.items(), columns=["Descriptor", "Count"]).sort_values("Count", ascending=False)
+
+    out_bin.to_csv("binary_systems_frequency.csv", index=False)
+    out_int.to_csv("intermediates_frequency.csv", index=False)
+    out_des.to_csv("descriptors_frequency.csv", index=False)
+    print("Extraction complete. Results saved to CSV files.")
+
+if __name__ == "__main__":
+    main()
