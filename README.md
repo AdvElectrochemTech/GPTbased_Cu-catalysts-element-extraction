@@ -1,1 +1,1 @@
-# GPTbased_Cu-catalysts-element-extraction
+Supporting code for publilcation: 
